@@ -39,6 +39,36 @@ REF_TIME_MULTI  = 90.0
 EPSILON = 1e-4
 INF     = float("inf")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Environment map  (loaded once per worker process from test_input/sunset.jpg)
+# ──────────────────────────────────────────────────────────────────────────────
+_env_pixels = None   # raw RGB bytes, or b"" if unavailable
+_env_w      = 0
+_env_h      = 0
+
+
+def _load_env_image():
+    """Load test_input/sunset.jpg as an equirectangular environment map.
+
+    Called once at the start of each worker process; results are cached in
+    module-level globals so subsequent chunks reuse the same data.
+    """
+    global _env_pixels, _env_w, _env_h
+    if _env_pixels is not None:
+        return                           # already loaded (or already failed)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    path       = os.path.join(script_dir, "test_input", "sunset.jpg")
+    if not os.path.isfile(path):
+        _env_pixels = b""
+        return
+    try:
+        from PIL import Image
+        img        = Image.open(path).convert("RGB")
+        _env_w, _env_h = img.size
+        _env_pixels = img.tobytes()
+    except Exception:
+        _env_pixels = b""
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Vec3 — minimalist 3-D vector (pure Python for maximum CPU load)
@@ -214,9 +244,19 @@ def _trace(ox, oy, oz, dx, dy, dz, spheres, lights, depth):
             t_min = t
             hit   = s
 
-    # ── Miss → return a simple sky-gradient colour ────────────────────────────
+    # ── Miss → sample the environment map (sunset.jpg) or fall back to sky ────
     if hit is None:
-        # dy is already the y-component of the normalised direction
+        if _env_pixels:
+            # Equirectangular projection: map unit ray direction → UV
+            u  = (math.atan2(dx, -dz) / (2.0 * math.pi) + 0.5) % 1.0
+            v  = max(0.0, min(1.0, 0.5 - math.asin(max(-1.0, min(1.0, dy))) / math.pi))
+            px = min(int(u * _env_w), _env_w - 1)
+            py = min(int(v * _env_h), _env_h - 1)
+            off = (py * _env_w + px) * 3
+            return Vec3(_env_pixels[off]     / 255.0,
+                        _env_pixels[off + 1] / 255.0,
+                        _env_pixels[off + 2] / 255.0)
+        # Fallback: procedural sky gradient when the image is unavailable
         sky = 0.5 * (dy + 1.0)
         return Vec3(0.08 + 0.12 * sky,
                     0.08 + 0.12 * sky,
@@ -312,6 +352,7 @@ def _render_chunk(args):
     """
     row_start, row_end, width, height, max_depth, samples = args
 
+    _load_env_image()          # populate env map globals once per process
     spheres, lights = build_scene()
 
     fov_tan = math.tan(math.pi / 6.0)   # half-angle for a 60° vertical FOV

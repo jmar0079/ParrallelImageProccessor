@@ -329,12 +329,16 @@ def _worker(args):
         if isinstance(source, str):
             img = _Img.open(source).convert("RGB")
             width, height = img.size
+            stem = Path(source).stem
         else:
             # source is raw bytes of a pre-generated synthetic image
             img = _Img.frombytes("RGB", (width, height), source)
+            stem = f"synthetic_{idx:04d}"
         result = _apply_pil_operations(img, ops, passes)
         if out_dir:
-            out_path = os.path.join(out_dir, f"processed_{idx:04d}.png")
+            os.makedirs(out_dir, exist_ok=True)
+            op_tag = "_".join(ops) if len(ops) <= 3 else f"{len(ops)}filters"
+            out_path = os.path.join(out_dir, f"{stem}_{op_tag}_{idx:04d}.png")
             result.save(out_path)
     else:
         if isinstance(source, str):
@@ -455,9 +459,14 @@ def _build_task_list(sources, width: int, height: int,
     ]
 
 
-def run_benchmark(mode: str, ops: list = None, out_dir: str = ""):
+def run_benchmark(mode: str, ops: list = None, out_dir: str = "",
+                  input_dir: str = ""):
     """
     Run the image-processing benchmark in 'single' or 'multi' mode.
+
+    If *input_dir* contains supported images those are used as the workload
+    (replicated to reach BENCH_COUNT tasks when fewer images are found).
+    Otherwise synthetic gradient images are generated automatically.
 
     Returns (score, elapsed_seconds, worker_count, image_count)
     """
@@ -468,26 +477,40 @@ def run_benchmark(mode: str, ops: list = None, out_dir: str = ""):
     workers   = 1 if mode == "single" else cpu_count
     use_pil   = _HAS_PIL
 
-    # Generate synthetic images (as raw bytes; PIL converts them in the worker)
-    print("  Generating synthetic test images ...", end="", flush=True)
-    if use_pil:
-        # Pass raw bytes; the worker will reconstruct the PIL Image
-        sources = [
-            _generate_synthetic_raw(BENCH_WIDTH, BENCH_HEIGHT, i)
-            for i in range(BENCH_COUNT)
-        ]
+    # ── Prefer real images from input_dir (or the default test_input folder) ──
+    script_dir    = os.path.dirname(os.path.abspath(__file__))
+    default_input = os.path.join(script_dir, "test_input")
+    search_dir    = input_dir if input_dir else default_input
+
+    real_files = []
+    if os.path.isdir(search_dir):
+        real_files = sorted(
+            str(p) for p in Path(search_dir).iterdir()
+            if p.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+    if real_files:
+        # Replicate the file list to reach BENCH_COUNT tasks
+        sources = [real_files[i % len(real_files)] for i in range(BENCH_COUNT)]
+        bench_w = bench_h = 0   # worker reads dimensions from the file
+        print(f"  Using {len(real_files)} real image(s) from: {search_dir}")
+        print(f"  ({BENCH_COUNT} tasks = {len(real_files)} image(s) × "
+              f"{BENCH_COUNT // max(len(real_files), 1) or 1} repetition(s))")
     else:
+        # Fall back to synthetic gradient images
+        print("  Generating synthetic test images ...", end="", flush=True)
         sources = [
             _generate_synthetic_raw(BENCH_WIDTH, BENCH_HEIGHT, i)
             for i in range(BENCH_COUNT)
         ]
-    print(f" {BENCH_COUNT} images ready.")
+        bench_w, bench_h = BENCH_WIDTH, BENCH_HEIGHT
+        print(f" {BENCH_COUNT} images ready.")
 
     label = "SINGLE-THREAD" if mode == "single" else "MULTI-CORE"
-    _print_section(label, BENCH_WIDTH, BENCH_HEIGHT,
+    _print_section(label, bench_w, bench_h,
                    BENCH_COUNT, BENCH_PASSES, workers)
 
-    tasks  = _build_task_list(sources, BENCH_WIDTH, BENCH_HEIGHT,
+    tasks  = _build_task_list(sources, bench_w, bench_h,
                               ops, BENCH_PASSES, use_pil, out_dir)
     total  = len(tasks)
     done   = 0
@@ -609,22 +632,34 @@ def _menu_benchmark() -> None:
     results = {}
     out_dir = ""
 
+    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    default_in  = os.path.join(script_dir, "test_input")
+    has_real    = os.path.isdir(default_in) and any(
+        Path(default_in).iterdir()
+    )
+
+    if has_real:
+        print(f"\n  Found images in test_input/ — those will be used as the workload.")
+    else:
+        print("\n  No images in test_input/ — synthetic images will be generated.")
+
     save = input("\n  Save processed benchmark images? (y/N): ").strip().lower()
     if save == "y":
-        script_dir = os.path.dirname(os.path.abspath(__file__))
         out_dir = os.path.join(script_dir, "benchmark_output")
         os.makedirs(out_dir, exist_ok=True)
 
     # ── Single-Thread ─────────────────────────────────────────────────────────
     input("\n  Press ENTER to start Single-Thread test ...")
-    score, elapsed, workers, count = run_benchmark("single", out_dir=out_dir)
+    score, elapsed, workers, count = run_benchmark(
+        "single", out_dir=out_dir, input_dir=default_in)
     _print_result("SINGLE-THREAD RESULT", score, elapsed, workers, count)
     results["single"] = (score, elapsed)
 
     # ── Multi-Core ────────────────────────────────────────────────────────────
     if multiprocessing.cpu_count() > 1:
         input("\n  Press ENTER to start Multi-Core test ...")
-        score, elapsed, workers, count = run_benchmark("multi", out_dir=out_dir)
+        score, elapsed, workers, count = run_benchmark(
+            "multi", out_dir=out_dir, input_dir=default_in)
         _print_result("MULTI-CORE RESULT", score, elapsed, workers, count)
         results["multi"] = (score, elapsed)
 
