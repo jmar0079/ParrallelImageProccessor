@@ -19,11 +19,14 @@ Optional     : Pillow  →  pip install Pillow   (strongly recommended)
                NumPy   →  pip install numpy    (faster pixel math)
 """
 
+import io
 import math
 import multiprocessing
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import time
 import zlib
 from pathlib import Path
@@ -42,6 +45,9 @@ BENCH_PASSES = 4          # filter passes per image  (increases CPU load)
 # Operations applied during benchmark  (all available operations)
 BENCH_OPERATIONS = ["blur", "sharpen", "contrast", "sepia", "edge"]
 
+# Number of horizontal strips the image is split into for panel processing
+PANEL_COUNT = 8
+
 # Reference time → 1 000 pts on the calibration machine (seconds)
 REF_TIME_SINGLE = 60.0
 REF_TIME_MULTI  = 60.0
@@ -54,6 +60,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp", "
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from PIL import Image as _PILImage, ImageFilter, ImageOps, ImageEnhance
+    _PILImage.MAX_IMAGE_PIXELS = None   # allow very large images
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
@@ -365,6 +372,33 @@ def _worker(args):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Panel worker  (top-level so it is picklable on Windows)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _panel_worker(args):
+    """
+    Process one horizontal strip (panel) of an image with PIL.
+    args = (idx, image_path, x0, y0, x1, y1, ops, passes[, src_y0, src_y1])
+    src_y0/src_y1: Y coordinates in the *original* full image (for GUI placement).
+    Returns (idx, src_y0, src_y1, png_bytes, elapsed_ms)
+    """
+    idx, image_path, x0, y0, x1, y1, ops, passes = args[:8]
+    src_y0 = args[8] if len(args) > 8 else y0
+    src_y1 = args[9] if len(args) > 9 else y1
+    t0 = time.perf_counter()
+    from PIL import Image as _Img
+    _Img.MAX_IMAGE_PIXELS = None
+    img = _Img.open(image_path).convert("RGB")
+    panel = img.crop((x0, y0, x1, y1))
+    img.close()
+    result = _apply_pil_operations(panel, ops, passes)
+    buf = io.BytesIO()
+    result.save(buf, format="PNG")
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    return idx, src_y0, src_y1, buf.getvalue(), elapsed_ms
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Console display helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -459,6 +493,98 @@ def _build_task_list(sources, width: int, height: int,
     ]
 
 
+def process_image_panels(image_path: str, mode: str,
+                         ops: list = None, passes: int = None,
+                         panel_count: int = None):
+    """
+    Generator: opens *image_path* at full native resolution, splits into
+    *panel_count* horizontal strips, applies filter ops to each, and yields
+    panel results as they complete.
+
+    Single mode  → panels processed sequentially top-to-bottom.
+    Multi  mode  → panels processed in parallel; yielded as each finishes
+                   (may arrive out of order, showing parallelism visually).
+
+    Yields: first ("init", img_w, img_h, preview_png_bytes)
+            then  ("panel", idx, src_y0, src_y1, img_w, img_h, png_bytes, ms)
+    """
+    if not _HAS_PIL:
+        raise RuntimeError("Pillow is required for panel processing.  "
+                           "Run: pip install Pillow")
+    if ops is None:
+        ops = BENCH_OPERATIONS
+    if passes is None:
+        passes = BENCH_PASSES
+    if panel_count is None:
+        panel_count = PANEL_COUNT
+
+    from PIL import Image as _Img
+    _Img.MAX_IMAGE_PIXELS = None
+
+    # ── Load the full-resolution image once ──────────────────────────────
+    print(f"  Opening image …", flush=True)
+    img = _Img.open(image_path).convert("RGB")
+    img_w, img_h = img.size
+    mpx = img_w * img_h / 1_000_000
+    print(f"  Full-resolution: {img_w}×{img_h} px  ({mpx:.0f} Mpx)")
+
+    # Small preview thumbnail for the GUI canvas (created before cropping)
+    preview = img.copy()
+    preview.thumbnail((760, 190), _Img.LANCZOS)
+    preview_buf = io.BytesIO()
+    preview.save(preview_buf, format="PNG")
+    preview_png_bytes = preview_buf.getvalue()
+    preview.close()
+
+    # ── Pre-crop each strip and save to a temp BMP (uncompressed = instant I/O)
+    # This avoids having every worker independently decode the full 1.5 GB image.
+    tmp_dir = tempfile.mkdtemp(prefix="pip_panels_")
+    panel_meta = []   # (idx, bmp_path, src_y0, src_y1, strip_h)
+    print(f"  Slicing {panel_count} panels …", flush=True)
+    for i in range(panel_count):
+        y0 = (i * img_h) // panel_count
+        y1 = ((i + 1) * img_h) // panel_count
+        strip = img.crop((0, y0, img_w, y1))
+        bmp_path = os.path.join(tmp_dir, f"panel_{i:02d}.bmp")
+        strip.save(bmp_path, format="BMP")
+        strip.close()
+        panel_meta.append((i, bmp_path, y0, y1, y1 - y0))
+        print(f"    sliced {i + 1}/{panel_count}", end="\r", flush=True)
+    img.close()
+    print()
+
+    try:
+        yield "init", img_w, img_h, preview_png_bytes
+        del preview_png_bytes
+
+        cpu_count = multiprocessing.cpu_count()
+        workers   = 1 if mode == "single" else cpu_count
+
+        # Each task passes src_y0/src_y1 so workers return proper canvas coords
+        tasks = [
+            (i, bmp_path, 0, 0, img_w, strip_h, ops, passes, src_y0, src_y1)
+            for i, bmp_path, src_y0, src_y1, strip_h in panel_meta
+        ]
+
+        label = "SINGLE-THREAD" if mode == "single" else "MULTI-CORE"
+        print(f"  [{label}]  {panel_count} panels  ·  {workers} worker(s)  ·  "
+              f"{len(ops)} filter(s) × {passes} pass(es)")
+
+        if workers == 1:
+            for task in tasks:
+                idx, src_y0, src_y1, png_bytes, elapsed_ms = _panel_worker(task)
+                print(f"    panel {idx + 1:>2}/{panel_count}  {elapsed_ms:7.0f} ms")
+                yield "panel", idx, src_y0, src_y1, img_w, img_h, png_bytes, elapsed_ms
+        else:
+            with multiprocessing.Pool(workers) as pool:
+                for result in pool.imap_unordered(_panel_worker, tasks):
+                    idx, src_y0, src_y1, png_bytes, elapsed_ms = result
+                    print(f"    panel {idx + 1:>2}/{panel_count}  {elapsed_ms:7.0f} ms")
+                    yield "panel", idx, src_y0, src_y1, img_w, img_h, png_bytes, elapsed_ms
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def run_benchmark(mode: str, ops: list = None, out_dir: str = "",
                   input_dir: str = ""):
     """
@@ -483,7 +609,9 @@ def run_benchmark(mode: str, ops: list = None, out_dir: str = "",
     search_dir    = input_dir if input_dir else default_input
 
     real_files = []
-    if os.path.isdir(search_dir):
+    if os.path.isfile(search_dir) and Path(search_dir).suffix.lower() in IMAGE_EXTENSIONS:
+        real_files = [search_dir]
+    elif os.path.isdir(search_dir):
         real_files = sorted(
             str(p) for p in Path(search_dir).iterdir()
             if p.suffix.lower() in IMAGE_EXTENSIONS

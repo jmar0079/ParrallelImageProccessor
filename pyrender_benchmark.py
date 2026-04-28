@@ -26,15 +26,15 @@ import time
 # Configuration — tweak to make the benchmark shorter / longer
 # ──────────────────────────────────────────────────────────────────────────────
 VERSION       = "1.0"
-RENDER_WIDTH  = 640           # output image width  (pixels)
-RENDER_HEIGHT = 360           # output image height (pixels)
+RENDER_WIDTH  = 1920          # output image width  (pixels)
+RENDER_HEIGHT = 1080          # output image height (pixels)
 MAX_DEPTH     = 5             # maximum reflection bounces per ray
 SAMPLES       = 1             # samples per pixel  (1 = no AA; 2 = 2×2 AA)
 
 # Calibration: the time (seconds) on the reference machine that earns 1 000 pts.
 # Lower  → harder to score high  |  Higher → easier to score high.
-REF_TIME_SINGLE = 90.0
-REF_TIME_MULTI  = 90.0
+REF_TIME_SINGLE = 810.0
+REF_TIME_MULTI  = 810.0
 
 EPSILON = 1e-4
 INF     = float("inf")
@@ -427,6 +427,25 @@ def _save_image(width, height, chunks, base="benchmark_render"):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Quick preview renderer
+# ──────────────────────────────────────────────────────────────────────────────
+def render_preview(width: int = 320, height: int = 180, max_depth: int = 3) -> bytes:
+    """
+    Render a small preview of the scene and return raw RGB bytes (width×height).
+    Runs single-threaded so it can be called from any background thread.
+    """
+    chunk_h = max(1, height // 16)
+    y = 0
+    rows = {}
+    while y < height:
+        y_end = min(y + chunk_h, height)
+        row_start, rgb = _render_chunk((y, y_end, width, height, max_depth, 1))
+        rows[row_start] = rgb
+        y = y_end
+    return b"".join(rows[k] for k in sorted(rows))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Benchmark runner
 # ──────────────────────────────────────────────────────────────────────────────
 def _print_progress(done, total, elapsed):
@@ -494,6 +513,67 @@ def run_benchmark(mode: str = "multi"):
     score       = int(1000 * score_scale * ref_time / elapsed)
 
     return score, elapsed, workers, chunks
+
+
+def run_benchmark_stream(mode: str = "multi"):
+    """
+    Like run_benchmark() but yields each completed chunk as
+        ("chunk", row_start, row_end, width, height, rgb_bytes)
+    and finally yields
+        ("result", score, elapsed, workers, chunks).
+    """
+    cpu_count = multiprocessing.cpu_count()
+    workers   = 1 if mode == "single" else cpu_count
+
+    chunk_h   = max(1, RENDER_HEIGHT // max(workers * 8, 16))
+    task_list = []
+    y = 0
+    while y < RENDER_HEIGHT:
+        y_end = min(y + chunk_h, RENDER_HEIGHT)
+        task_list.append((y, y_end, RENDER_WIDTH, RENDER_HEIGHT, MAX_DEPTH, SAMPLES))
+        y = y_end
+
+    # Build a lookup so we can recover row_end from row_start
+    row_end_map = {args[0]: args[1] for args in task_list}
+
+    n_chunks = len(task_list)
+    label    = "SINGLE-CORE" if mode == "single" else "MULTI-CORE"
+
+    print(f"\n  ┌─ {label} {'─' * (53 - len(label))}┐")
+    print(f"  │  {RENDER_WIDTH} × {RENDER_HEIGHT} px  │  depth {MAX_DEPTH}  │  "
+          f"{SAMPLES}×{SAMPLES} spp  │  {workers} worker(s)  │  {n_chunks} chunks  │")
+    print(f"  └{'─' * 63}┘\n")
+
+    t0     = time.perf_counter()
+    chunks = []
+    done   = 0
+
+    if workers == 1:
+        for args in task_list:
+            row_start, rgb = _render_chunk(args)
+            row_end = args[1]
+            chunks.append((row_start, rgb))
+            done += 1
+            _print_progress(done, n_chunks, time.perf_counter() - t0)
+            yield ("chunk", row_start, row_end, RENDER_WIDTH, RENDER_HEIGHT, rgb)
+    else:
+        with multiprocessing.Pool(workers) as pool:
+            for result in pool.imap_unordered(_render_chunk, task_list):
+                row_start, rgb = result
+                row_end = row_end_map[row_start]
+                chunks.append(result)
+                done += 1
+                _print_progress(done, n_chunks, time.perf_counter() - t0)
+                yield ("chunk", row_start, row_end, RENDER_WIDTH, RENDER_HEIGHT, rgb)
+
+    elapsed = time.perf_counter() - t0
+    print()
+
+    ref_time    = REF_TIME_SINGLE if mode == "single" else REF_TIME_MULTI
+    score_scale = 1 if mode == "single" else cpu_count
+    score       = int(1000 * score_scale * ref_time / elapsed)
+
+    yield ("result", score, elapsed, workers, chunks)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

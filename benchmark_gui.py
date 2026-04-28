@@ -11,11 +11,13 @@ Optional    : psutil  →  pip install psutil   (for RAM display)
 
 import io
 import multiprocessing
+import json
 import os
 import platform
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -26,6 +28,9 @@ if _HERE not in sys.path:
 
 import pyrender_benchmark       as _rt   # noqa: E402
 import parallel_image_processor as _ip   # noqa: E402
+
+# ── Single source image used by both benchmarks ───────────────────────────────
+_SOURCE_IMAGE = os.path.join(_HERE, "test_input", "2x-2x-2x-2x-6yefSc.png")
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 _BG    = "#0d0d1a"   # window background
@@ -38,6 +43,16 @@ _YEL   = "#ffa502"   # yellow – status bar
 _TXT   = "#dfe6e9"   # main text
 _DIM   = "#636e72"   # dimmed text / separators
 _WHT   = "#ffffff"   # bright white
+
+# ── Quartile reference thresholds ─────────────────────────────────────────────
+# Scores below bound[0] → Q1, below bound[1] → Q2, below bound[2] → Q3, else Q4
+_QUARTILE_BOUNDS = {
+    "rt_single": (4_000,   12_000,  30_000),
+    "rt_multi":  (50_000, 250_000, 700_000),
+    "ip_single": (4_000,   12_000,  30_000),
+    "ip_multi":  (50_000, 250_000, 700_000),
+}
+_QUARTILE_COLORS = {"Q1": "#e17055", "Q2": _YEL, "Q3": _GRN, "Q4": "#00cec9"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Thread-local stdout proxy
@@ -152,8 +167,8 @@ class App(tk.Tk):
         super().__init__()
         self.title("Benchmark Suite")
         self.configure(bg=_BG)
-        self.minsize(880, 660)
-        self._center(960, 720)
+        self.minsize(880, 760)
+        self._center(960, 820)
 
         self._q     = queue.Queue()
         self._busy  = False
@@ -161,6 +176,17 @@ class App(tk.Tk):
         # Preview image references (must be kept alive to avoid GC)
         self._preview_imgs:   dict[str, object] = {}
         self._preview_labels: dict[str, tk.Label] = {}
+
+        # Panel canvas for the Image Processor card
+        self._ip_canvas: tk.Canvas | None = None
+        self._ip_panel_photos: list = []   # keep PhotoImage refs from GC
+        self._ip_panel_count: int  = 0
+
+        # Shared canvas for the Ray Tracer card
+        self._rt_canvas: tk.Canvas | None = None
+        self._rt_canvas_photos: list = []
+        self._rt_render_w: int = _rt.RENDER_WIDTH
+        self._rt_render_h: int = _rt.RENDER_HEIGHT
 
         # Score display variables
         self._scores = {
@@ -172,6 +198,30 @@ class App(tk.Tk):
         self._status = tk.StringVar(value="Ready")
         self._pb: dict[str, ttk.Progressbar] = {}
         self._buttons: list[tk.Button] = []
+
+        # Live elapsed timer per card
+        self._timer_vars    = {"rt": tk.StringVar(value="—"), "ip": tk.StringVar(value="—")}
+        self._timer_start:  dict[str, float] = {}
+        self._timer_running = {"rt": False, "ip": False}
+
+        # Per-test elapsed time and quartile rank
+        self._time_vars = {
+            "rt_single": tk.StringVar(value=""),
+            "rt_multi":  tk.StringVar(value=""),
+            "ip_single": tk.StringVar(value=""),
+            "ip_multi":  tk.StringVar(value=""),
+        }
+        self._rank_vars = {
+            "rt_single": tk.StringVar(value=""),
+            "rt_multi":  tk.StringVar(value=""),
+            "ip_single": tk.StringVar(value=""),
+            "ip_multi":  tk.StringVar(value=""),
+        }
+        self._rank_labels: dict[str, tk.Label] = {}
+
+        # Score history (persisted to JSON)
+        self._score_history_file = os.path.join(_HERE, "benchmark_scores.json")
+        self._current_session: dict = {}
 
         self._apply_style()
         self._build_ui()
@@ -200,6 +250,7 @@ class App(tk.Tk):
         self._header()
         self._sysinfo_panel()
         self._cards_row()
+        self._history_panel()
         self._statusbar()
         self._log_panel()
 
@@ -210,6 +261,13 @@ class App(tk.Tk):
                  font=("Segoe UI", 18, "bold"), bg=_CARD, fg=_WHT).pack()
         tk.Label(f, text="Ray Tracer  ·  Image Processor  ·  System Scores",
                  font=("Segoe UI", 9), bg=_CARD, fg=_DIM).pack()
+        tk.Button(
+            f, text="↺  Reset", font=("Segoe UI", 8, "bold"),
+            bg="#2a2a3e", fg=_TXT,
+            activebackground="#3a3a4e", activeforeground=_WHT,
+            relief="flat", padx=8, pady=4, cursor="hand2",
+            command=self._reset,
+        ).place(relx=1.0, rely=0.5, anchor="e", x=-12)
 
     def _sysinfo_panel(self):
         outer = tk.Frame(self, bg=_BG, padx=10, pady=8)
@@ -260,6 +318,7 @@ class App(tk.Tk):
         """Return a tk.PhotoImage thumbnail, or None on failure."""
         try:
             from PIL import Image as _PILImg
+            _PILImg.MAX_IMAGE_PIXELS = None
             img = _PILImg.open(path).convert("RGB")
             img.thumbnail((max_w, max_h), _PILImg.LANCZOS)
             # Convert to PhotoImage via PPM bytes (no temp file)
@@ -287,9 +346,81 @@ class App(tk.Tk):
             lbl.configure(text="(preview unavailable)",
                           image="", bg=_CARD2)
 
+    def _load_rt_preview(self):
+        """Render a low-res spheres preview in a background thread and show it."""
+        try:
+            rgb = _rt.render_preview(320, 180, max_depth=3)
+        except Exception:
+            return
+        if not self._rt_preview_active:
+            return
+        try:
+            from PIL import Image as _PILImg, ImageTk
+            img = _PILImg.frombytes("RGB", (320, 180), rgb)
+            canvas = self._rt_canvas
+            cw = canvas.winfo_width() or 380
+            img = img.resize((cw, 190), _PILImg.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self._rt_canvas_photos.append(photo)
+
+            def _show():
+                if not self._rt_preview_active:
+                    return
+                canvas.delete("all")
+                canvas.create_image(0, 0, anchor="nw", image=photo)
+
+            canvas.after(0, _show)
+        except Exception:
+            pass
+
+    def _load_source_image_to_canvas(self, canvas, photos_list):
+        """Load the source image to *canvas* in a background thread."""
+        src = _SOURCE_IMAGE
+        if not os.path.isfile(src):
+            return
+
+        def _bg():
+            try:
+                from PIL import Image as _PILImg
+                _PILImg.MAX_IMAGE_PIXELS = None
+                img = _PILImg.open(src).convert("RGB")
+                img.thumbnail((760, 190), _PILImg.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+                self.after(0, lambda: self._draw_png_on_canvas(
+                    canvas, png_bytes, photos_list))
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _draw_png_on_canvas(self, canvas, png_bytes, photos_list):
+        """Render PNG bytes onto *canvas*. Must be called from the main thread."""
+        if canvas is None:
+            return
+        cw = canvas.winfo_width() or 380
+        ch = 190
+        try:
+            from PIL import Image as _PILImg, ImageTk
+            _PILImg.MAX_IMAGE_PIXELS = None
+            buf = io.BytesIO(png_bytes)
+            img = _PILImg.open(buf).convert("RGB")
+            img = img.resize((cw, ch), _PILImg.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            photos_list.clear()
+            photos_list.append(photo)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=photo)
+        except Exception:
+            canvas.delete("all")
+            canvas.create_text(cw // 2, ch // 2,
+                               text="(preview unavailable)",
+                               fill=_DIM, font=("Consolas", 8))
+
     # ── Score box ─────────────────────────────────────────────────────────────
     def _score_box(self, parent, label: str, var: tk.StringVar,
-                   col: int, color: str):
+                   col: int, color: str, key: str = ""):
         f = tk.Frame(parent, bg=_CARD2, padx=14, pady=10)
         f.grid(row=0, column=col, sticky="ew",
                padx=(0 if col == 0 else 8, 0))
@@ -300,6 +431,13 @@ class App(tk.Tk):
                  font=("Segoe UI", 24, "bold"), bg=_CARD2, fg=color).pack()
         tk.Label(f, text="pts",
                  font=("Segoe UI", 7), bg=_CARD2, fg=_DIM).pack()
+        if key:
+            tk.Label(f, textvariable=self._time_vars[key],
+                     font=("Segoe UI", 8), bg=_CARD2, fg=_DIM).pack()
+            rl = tk.Label(f, textvariable=self._rank_vars[key],
+                          font=("Segoe UI", 10, "bold"), bg=_CARD2, fg=_DIM)
+            rl.pack()
+            self._rank_labels[key] = rl
 
     # ── Ray Tracer card ────────────────────────────────────────────────────────
     def _build_rt_card(self, parent):
@@ -317,13 +455,16 @@ class App(tk.Tk):
 
         sf = tk.Frame(card, bg=_CARD)
         sf.pack(fill="x", pady=(0, 10))
-        self._score_box(sf, "SINGLE-CORE", self._scores["rt_single"], 0, _RT)
-        self._score_box(sf, "MULTI-CORE",  self._scores["rt_multi"],  1, _RT)
+        self._score_box(sf, "SINGLE-CORE", self._scores["rt_single"], 0, _RT, key="rt_single")
+        self._score_box(sf, "MULTI-CORE",  self._scores["rt_multi"],  1, _RT, key="rt_multi")
 
         pb = ttk.Progressbar(card, style="RT.Horizontal.TProgressbar",
                              mode="indeterminate")
-        pb.pack(fill="x", pady=(0, 6))
+        pb.pack(fill="x", pady=(0, 2))
         self._pb["rt"] = pb
+        tk.Label(card, textvariable=self._timer_vars["rt"],
+                 font=("Consolas", 8), bg=_CARD, fg=_RT, anchor="e"
+                 ).pack(fill="x", pady=(0, 4))
 
         bf = tk.Frame(card, bg=_CARD)
         bf.pack(fill="x", pady=(0, 6))
@@ -346,15 +487,22 @@ class App(tk.Tk):
                 b.pack(side="right")
             self._buttons.append(b)
 
-        # Image preview placeholder (Ray Tracer output)
-        tk.Label(card, text="RENDERED OUTPUT",
+        # Image preview canvas (same source image as Image Processor card)
+        tk.Label(card, text="IMAGE PREVIEW",
                  font=("Segoe UI", 7, "bold"), bg=_CARD, fg=_DIM
                  ).pack(anchor="w", pady=(4, 2))
-        prev = tk.Label(card, text="— run a benchmark to see the render —",
-                        font=("Segoe UI", 7), bg=_CARD2, fg=_DIM,
-                        width=50, height=10, anchor="center")
-        prev.pack(fill="x")
-        self._preview_labels["rt"] = prev
+        rt_canvas = tk.Canvas(card, bg="#08081a", height=190,
+                              highlightthickness=0)
+        rt_canvas.pack(fill="x")
+        self._rt_canvas = rt_canvas
+        self._rt_canvas_photos = []
+        self._rt_preview_active = True  # cleared when a benchmark run starts
+        # Render a low-res preview of the spheres scene in the background
+        rt_canvas.after(50, lambda: rt_canvas.create_text(
+            rt_canvas.winfo_width() // 2 or 190, 95,
+            text="Rendering preview…",
+            fill=_DIM, font=("Segoe UI", 8), tags="placeholder"))
+        threading.Thread(target=self._load_rt_preview, daemon=True).start()
 
     # ── Image Processor card ───────────────────────────────────────────────────
     def _build_ip_card(self, parent):
@@ -372,13 +520,16 @@ class App(tk.Tk):
 
         sf = tk.Frame(card, bg=_CARD)
         sf.pack(fill="x", pady=(0, 10))
-        self._score_box(sf, "SINGLE-THREAD", self._scores["ip_single"], 0, _IP)
-        self._score_box(sf, "MULTI-CORE",    self._scores["ip_multi"],  1, _IP)
+        self._score_box(sf, "SINGLE-THREAD", self._scores["ip_single"], 0, _IP, key="ip_single")
+        self._score_box(sf, "MULTI-CORE",    self._scores["ip_multi"],  1, _IP, key="ip_multi")
 
         pb = ttk.Progressbar(card, style="IP.Horizontal.TProgressbar",
                              mode="indeterminate")
-        pb.pack(fill="x", pady=(0, 6))
+        pb.pack(fill="x", pady=(0, 2))
         self._pb["ip"] = pb
+        tk.Label(card, textvariable=self._timer_vars["ip"],
+                 font=("Consolas", 8), bg=_CARD, fg=_IP, anchor="e"
+                 ).pack(fill="x", pady=(0, 4))
 
         bf = tk.Frame(card, bg=_CARD)
         bf.pack(fill="x", pady=(0, 6))
@@ -401,19 +552,16 @@ class App(tk.Tk):
                 b.pack(side="right")
             self._buttons.append(b)
 
-        # Image preview placeholder (input / output)
-        tk.Label(card, text="IMAGE PREVIEW",
+        # Panel-by-panel image preview canvas
+        tk.Label(card, text="IMAGE PREVIEW  ·  panel processing",
                  font=("Segoe UI", 7, "bold"), bg=_CARD, fg=_DIM
                  ).pack(anchor="w", pady=(4, 2))
-        prev = tk.Label(card, text="— run a benchmark to see the image —",
-                        font=("Segoe UI", 7), bg=_CARD2, fg=_DIM,
-                        width=50, height=10, anchor="center")
-        prev.pack(fill="x")
-        self._preview_labels["ip"] = prev
-        # Show the input image right away if it exists
-        _sunset = os.path.join(_HERE, "test_input", "sunset.jpg")
-        if os.path.isfile(_sunset):
-            self.after(200, lambda: self._show_preview("ip", _sunset))
+        canvas = tk.Canvas(card, bg="#08081a", height=190, highlightthickness=0)
+        canvas.pack(fill="x")
+        self._ip_canvas = canvas
+        self._ip_panel_photos = []
+        self.after(250, lambda: self._load_source_image_to_canvas(
+            self._ip_canvas, self._ip_panel_photos))
 
     # ── Status bar ─────────────────────────────────────────────────────────────
     def _statusbar(self):
@@ -444,12 +592,143 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self._log.pack(fill="both", expand=True)
 
+    # ── History panel ─────────────────────────────────────────────────────────
+    def _history_panel(self):
+        outer = tk.Frame(self, bg=_BG, padx=10, pady=2)
+        outer.pack(fill="x")
+        f = tk.Frame(outer, bg=_CARD2, padx=14, pady=8)
+        f.pack(fill="x")
+        tk.Label(f, text="SCORE HISTORY  ·  last 5 runs  (colour = quartile  Q1 worst → Q4 best)",
+                 font=("Segoe UI", 7, "bold"), bg=_CARD2, fg=_DIM
+                 ).pack(anchor="w", pady=(0, 4))
+        self._history_text = tk.Text(
+            f, bg=_CARD2, fg=_TXT, font=("Consolas", 7),
+            relief="flat", state="disabled", height=4,
+            highlightthickness=0, wrap="none",
+        )
+        self._history_text.pack(fill="x")
+        for q, c in _QUARTILE_COLORS.items():
+            self._history_text.tag_configure(q, foreground=c)
+        self._history_text.tag_configure("dim", foreground=_DIM)
+        self._history_text.tag_configure("hdr",
+            foreground=_DIM, font=("Consolas", 7, "bold"))
+        self._refresh_history()
+
+    def _refresh_history(self):
+        history = self._load_history()
+        t = self._history_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("end",
+            f"  {'Date':<18}  {'RT-1C':>12}  {'RT-nC':>14}  "
+            f"{'IP-1T':>12}  {'IP-nC':>14}\n", "hdr")
+        t.insert("end", "  " + "\u2500" * 72 + "\n", "dim")
+        for entry in list(reversed(history[-5:])):
+            date = entry.get("date", "?")
+            t.insert("end", f"  {date:<18}  ")
+            for k, width in [("rt_single", 12), ("rt_multi", 14),
+                              ("ip_single", 12), ("ip_multi", 14)]:
+                v = entry.get(k)
+                if v is None:
+                    t.insert("end", f"{'—':>{width}}  ", "dim")
+                else:
+                    rank = self._compute_rank(k, v)
+                    t.insert("end", f"{f'{v:,} {rank}':>{width}}  ", rank)
+            t.insert("end", "\n")
+        if not history:
+            t.insert("end", "  No runs recorded yet.\n", "dim")
+        t.configure(state="disabled")
+
+    # ── Score persistence & ranking ───────────────────────────────────────────
+    def _load_history(self) -> list:
+        if not os.path.isfile(self._score_history_file):
+            return []
+        try:
+            with open(self._score_history_file, encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return []
+
+    def _save_session(self):
+        if not self._current_session or len(self._current_session) <= 1:
+            return   # only the date key, no scores yet
+        history = self._load_history()
+        history.append(self._current_session)
+        try:
+            with open(self._score_history_file, "w", encoding="utf-8") as fh:
+                json.dump(history, fh, indent=2)
+        except Exception:
+            pass
+        self._refresh_history()
+
+    def _compute_rank(self, key: str, score: int) -> str:
+        q1, q2, q3 = _QUARTILE_BOUNDS.get(key, (4_000, 12_000, 30_000))
+        if score < q1:  return "Q1"
+        if score < q2:  return "Q2"
+        if score < q3:  return "Q3"
+        return "Q4"
+
+    # ── Timer helpers ─────────────────────────────────────────────────────────
+    def _start_timer(self, bench: str):
+        self._timer_start[bench] = time.perf_counter()
+        self._timer_running[bench] = True
+        self._timer_vars[bench].set("0.0 s")
+        self._tick_timer(bench)
+
+    def _stop_timer(self, bench: str):
+        if self._timer_running.get(bench):
+            elapsed = time.perf_counter() - self._timer_start.get(bench, 0.0)
+            self._timer_vars[bench].set(f"{elapsed:.2f} s  \u2714")
+        self._timer_running[bench] = False
+
+    def _tick_timer(self, bench: str):
+        if self._timer_running.get(bench):
+            elapsed = time.perf_counter() - self._timer_start.get(bench, 0.0)
+            self._timer_vars[bench].set(f"{elapsed:.1f} s")
+            self.after(100, lambda: self._tick_timer(bench))
+
+    # ── Reset ─────────────────────────────────────────────────────────────────
+    def _reset(self):
+        if self._busy:
+            return
+        for v in self._scores.values():
+            v.set("\u2014")
+        for v in self._timer_vars.values():
+            v.set("\u2014")
+        for v in self._time_vars.values():
+            v.set("")
+        for v in self._rank_vars.values():
+            v.set("")
+        for lbl in self._rank_labels.values():
+            lbl.configure(fg=_DIM)
+        self._log.configure(state="normal")
+        self._log.delete("1.0", "end")
+        self._log.configure(state="disabled")
+        self._status.set("Ready")
+        self._current_session = {}
+        self._rt_canvas_photos = []
+        self._ip_panel_photos  = []
+        self._ip_src_img       = None
+        if self._rt_canvas:
+            self._rt_canvas.delete("all")
+            self._rt_canvas.configure(bg="#08081a")
+            self._rt_canvas.create_text(
+                self._rt_canvas.winfo_width() // 2 or 190, 95,
+                text="Rendering preview…",
+                fill=_DIM, font=("Segoe UI", 8), tags="placeholder")
+            self._rt_preview_active = True
+            threading.Thread(target=self._load_rt_preview, daemon=True).start()
+        if self._ip_canvas:
+            self.after(100, lambda: self._load_source_image_to_canvas(
+                self._ip_canvas, self._ip_panel_photos))
+
     # ── Benchmark launcher ────────────────────────────────────────────────────
     def _run(self, bench: str, mode: str):
         if self._busy:
             self._log_append("⚠  A benchmark is already running — please wait.\n")
             return
         self._busy = True
+        self._current_session = {"date": time.strftime("%Y-%m-%d %H:%M")}
         for b in self._buttons:
             b.configure(state="disabled")
         threading.Thread(
@@ -471,29 +750,37 @@ class App(tk.Tk):
 
             for m in modes:
                 if bench == "rt":
-                    score, elapsed, workers, chunks = _rt.run_benchmark(m)
-                    img_path = _rt._save_image(
-                        _rt.RENDER_WIDTH, _rt.RENDER_HEIGHT, chunks,
-                        base=os.path.join(_HERE, "benchmark_render"),
-                    )
-                    q.put(("rt_score", m, score, elapsed, workers, img_path))
-                    q.put(("show_image", "rt", img_path))
+                    q.put(("rt_chunk_init", _rt.RENDER_HEIGHT))
+                    score = elapsed = workers = 0
+                    for item in _rt.run_benchmark_stream(m):
+                        if item[0] == "chunk":
+                            _, row_start, row_end, _w, _h, _rgb = item
+                            q.put(("rt_chunk", row_start, row_end, _rt.RENDER_WIDTH, _rt.RENDER_HEIGHT, _rgb))
+                        else:  # "result"
+                            _, score, elapsed, workers, _chunks = item
+                    q.put(("rt_score", m, score, elapsed, workers))
                 else:
-                    in_dir = os.path.join(_HERE, "test_input")
-                    score, elapsed, workers, count = _ip.run_benchmark(
-                        m, input_dir=in_dir
-                    )
-                    q.put(("ip_score", m, score, elapsed, workers, count))
-                    # Show first processed output if saved, else keep input
-                    out_dir = os.path.join(_HERE, "benchmark_output")
-                    if os.path.isdir(out_dir):
-                        outs = sorted(
-                            f for f in os.listdir(out_dir)
-                            if f.lower().endswith((".png", ".jpg", ".ppm"))
-                        )
-                        if outs:
-                            q.put(("show_image", "ip",
-                                   os.path.join(out_dir, outs[0])))
+                    img_path = _SOURCE_IMAGE
+                    panel_count = _ip.PANEL_COUNT
+                    t_start = time.perf_counter()
+                    for item in _ip.process_image_panels(img_path, m):
+                        if item[0] == "init":
+                            _, iw, ih, full_png = item
+                            q.put(("ip_panel_init", iw, ih, panel_count,
+                                   full_png))
+                        else:  # "panel"
+                            _, idx, y0, y1, iw, ih, png_bytes, _ms = item
+                            q.put(("ip_panel", idx, panel_count,
+                                   y0, y1, iw, ih, png_bytes))
+                    elapsed = time.perf_counter() - t_start
+                    ref = (_ip.REF_TIME_SINGLE if m == "single"
+                           else _ip.REF_TIME_MULTI)
+                    scale = 1 if m == "single" else multiprocessing.cpu_count()
+                    score = int(1000 * scale * ref / max(elapsed, 0.001))
+                    workers_n = (1 if m == "single"
+                                 else multiprocessing.cpu_count())
+                    q.put(("ip_score", m, score, elapsed, workers_n,
+                           panel_count))
 
         except Exception as exc:
             import traceback
@@ -526,42 +813,140 @@ class App(tk.Tk):
 
         elif kind == "pb_start":
             self._pb[msg[1]].start(10)
+            self._start_timer(msg[1])
 
         elif kind == "pb_stop":
             self._pb[msg[1]].stop()
             self._pb[msg[1]].configure(value=0)
+            self._stop_timer(msg[1])
 
         elif kind == "show_image":
             _, bench, path = msg
             self._show_preview(bench, path)
 
+        elif kind == "ip_panel_init":
+            _, img_w, img_h, panel_count, full_png_bytes = msg
+            self._ip_panel_count  = panel_count
+            self._ip_panel_photos = []
+            self._ip_src_img      = None   # cached at canvas size, loaded on first panel
+            canvas = self._ip_canvas
+            if canvas:
+                canvas.delete("all")
+                canvas.configure(bg="#000000")
+
+        elif kind == "ip_panel":
+            _, idx, panel_count, y0_src, y1_src, img_w, img_h, png_bytes = msg
+            canvas = self._ip_canvas
+            if canvas is None:
+                return
+            cw = canvas.winfo_width() or 380
+            ch = 190
+            ph = ch / panel_count
+            display_y = int(idx * ph)
+            display_h = max(1, round(ph))
+            try:
+                from PIL import Image as _PILImg, ImageTk
+                _PILImg.MAX_IMAGE_PIXELS = None
+                # Load + cache the source image at canvas size once
+                if not getattr(self, "_ip_src_img", None):
+                    src = _PILImg.open(_SOURCE_IMAGE).convert("RGB")
+                    self._ip_src_img = src.resize((cw, ch), _PILImg.LANCZOS)
+                band = self._ip_src_img.crop((0, display_y, cw, display_y + display_h))
+                photo = ImageTk.PhotoImage(band)
+                self._ip_panel_photos.append(photo)   # prevent GC
+                canvas.delete(f"panel_{idx}")
+                canvas.create_image(0, display_y, anchor="nw",
+                                    image=photo, tags=f"panel_{idx}")
+            except Exception:
+                canvas.create_rectangle(0, display_y, cw, display_y + display_h,
+                                        fill=_IP, outline="",
+                                        tags=f"panel_{idx}")
+
+        elif kind == "rt_chunk_init":
+            _, render_h = msg
+            self._rt_preview_active = False   # prevent preview thread from drawing
+            self._rt_canvas_photos = []
+            canvas = self._rt_canvas
+            if canvas:
+                canvas.delete("all")
+                canvas.configure(bg="#000000")
+
+        elif kind == "rt_chunk":
+            _, row_start, row_end, render_w, render_h, rgb_bytes = msg
+            canvas = self._rt_canvas
+            if canvas is None:
+                return
+            cw = canvas.winfo_width() or 380
+            ch = 190
+            y0 = int(row_start / render_h * ch)
+            y1 = int(row_end   / render_h * ch)
+            band_h = max(1, y1 - y0)
+            try:
+                from PIL import Image as _PILImg, ImageTk
+                src_band_h = row_end - row_start
+                band = _PILImg.frombytes("RGB", (render_w, src_band_h), rgb_bytes)
+                band = band.resize((cw, band_h), _PILImg.LANCZOS)
+                photo = ImageTk.PhotoImage(band)
+                self._rt_canvas_photos.append(photo)
+                canvas.create_image(0, y0, anchor="nw", image=photo)
+            except Exception:
+                canvas.create_rectangle(0, y0, cw, y0 + band_h,
+                                        fill=_RT, outline="")
+
         elif kind == "rt_score":
-            _, m, score, elapsed, workers, img_path = msg
-            self._scores[f"rt_{m}"].set(f"{score:,}")
+            _, m, score, elapsed, workers = msg
+            key = f"rt_{m}"
+            self._scores[key].set(f"{score:,}")
+            self._time_vars[key].set(f"{elapsed:.2f} s")
+            rank = self._compute_rank(key, score)
+            self._rank_vars[key].set(rank)
+            if key in self._rank_labels:
+                self._rank_labels[key].configure(fg=_QUARTILE_COLORS.get(rank, _DIM))
+            self._current_session[key] = score
             self._log_append(
-                f"\n  ✔  Ray Tracer [{m.upper()}]\n"
+                f"\n  ✔  Ray Tracer [{m.upper()}]  —  {rank}\n"
                 f"     Score   : {score:>10,} pts\n"
                 f"     Time    : {elapsed:>10.2f} s\n"
                 f"     Workers : {workers:>10}\n"
-                f"     Image   : {img_path}\n"
             )
+            # Show source image on RT canvas after benchmark finishes
+            self._rt_canvas_photos = []
+            self._rt_src_img = None
+            if self._rt_canvas:
+                self.after(50, lambda: self._load_source_image_to_canvas(
+                    self._rt_canvas, self._rt_canvas_photos))
 
         elif kind == "ip_score":
             _, m, score, elapsed, workers, count = msg
-            self._scores[f"ip_{m}"].set(f"{score:,}")
+            key = f"ip_{m}"
+            self._scores[key].set(f"{score:,}")
+            self._time_vars[key].set(f"{elapsed:.2f} s")
+            rank = self._compute_rank(key, score)
+            self._rank_vars[key].set(rank)
+            if key in self._rank_labels:
+                self._rank_labels[key].configure(fg=_QUARTILE_COLORS.get(rank, _DIM))
+            self._current_session[key] = score
             self._log_append(
-                f"\n  ✔  Image Processor [{m.upper()}]\n"
+                f"\n  ✔  Image Processor [{m.upper()}]  —  {rank}\n"
                 f"     Score   : {score:>10,} pts\n"
                 f"     Time    : {elapsed:>10.2f} s\n"
                 f"     Workers : {workers:>10}\n"
                 f"     Images  : {count:>10}\n"
             )
+            # Restore source image on IP canvas after benchmark finishes
+            self._ip_panel_photos = []
+            self._ip_src_img = None
+            if self._ip_canvas:
+                self._ip_canvas.configure(bg="#08081a")
+                self.after(50, lambda: self._load_source_image_to_canvas(
+                    self._ip_canvas, self._ip_panel_photos))
 
         elif kind == "done":
             self._busy = False
             self._status.set("Ready")
             for b in self._buttons:
                 b.configure(state="normal")
+            self._save_session()
 
     # ── Log helper ─────────────────────────────────────────────────────────────
     def _log_append(self, text: str):

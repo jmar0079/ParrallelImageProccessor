@@ -1,0 +1,222 @@
+================================================================================
+  PARALLEL BENCHMARK SUITE — PROGRAM ANALYSIS
+  Covers: benchmark_gui.py  |  pyrender_benchmark.py  |  parallel_image_processor.py
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.  OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+This program is a CPU benchmark suite with a dark-themed GUI.  It measures how
+fast your machine can complete two fundamentally different workloads:
+
+  A) Ray Tracer (pyrender_benchmark.py)
+       Renders a 3-D scene by casting millions of rays and computing reflections,
+       shadows, and shading entirely in pure Python.
+
+  B) Image Processor (parallel_image_processor.py)
+       Loads a real high-resolution photograph, splits it into horizontal strips,
+       and applies a filter pipeline (blur, sharpen, edge-detect, sepia,
+       contrast) to each strip using Pillow.
+
+Each workload runs twice — once using 1 thread (Single-Core / Single-Thread)
+and once using every logical CPU core available (Multi-Core).  The resulting
+scores follow the same formula as Cinebench R23:
+
+  Single score = 1,000 × (REF_TIME / actual_seconds)
+  Multi  score = 1,000 × cpu_count × (REF_TIME / actual_seconds)
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.  HOW PARALLELISM IS IMPLEMENTED
+────────────────────────────────────────────────────────────────────────────────
+
+Both benchmarks use Python's "multiprocessing" module — NOT threading.
+
+Why multiprocessing instead of threading?
+  Python has a Global Interpreter Lock (GIL) that prevents multiple OS threads
+  from executing pure-Python bytecode at the same time.  Multiprocessing spawns
+  separate OS processes, each with its own Python interpreter and its own GIL,
+  so they truly run in parallel on separate CPU cores simultaneously.
+
+──────────────────────────────────────────
+2A.  RAY TRACER  (pyrender_benchmark.py)
+──────────────────────────────────────────
+
+The image (1920×1080 pixels) is divided into horizontal row-bands called "chunks".
+
+  Single-Core mode  → ~17  chunks, processed one at a time in the main process.
+  Multi-Core  mode  → ~135 chunks, distributed across all 16 logical cores using
+                      a multiprocessing.Pool with pool.imap_unordered().
+
+  multiprocessing.Pool.imap_unordered()
+    - Submits all chunk tasks to a pool of worker processes.
+    - Returns results in whichever order they finish (fastest first).
+    - The main process collects results as they stream in and updates the GUI.
+    - Because tasks are unordered, the canvas fills in non-sequentially during
+      multi-core mode — the visual proof that cores are racing each other.
+
+  Work per chunk:
+    Each worker process calls _render_chunk(), which:
+      1. Loads an environment map image (once per process, cached globally).
+      2. Rebuilds the scene (sphere geometry, lights, materials).
+      3. Traces a ray for every pixel in its assigned row-band:
+           - Casts a primary ray from the camera.
+           - Recursively traces reflections up to MAX_DEPTH = 5 bounces.
+           - Computes Phong shading + shadow rays for each light.
+           - Samples the equirectangular environment map for background colour.
+      4. Returns (row_start, raw_RGB_bytes) back to the parent process.
+
+  Inter-process communication:
+    Results travel back from worker processes to the main process through
+    Python's multiprocessing Pipe/Queue internals (handled automatically by
+    Pool).  The GUI's background thread receives them and forwards them to the
+    tkinter event loop via a thread-safe queue.Queue().
+
+──────────────────────────────────────────────────────────────────────────────
+2B.  IMAGE PROCESSOR  (parallel_image_processor.py)
+──────────────────────────────────────────────────────────────────────────────
+
+The source image is loaded at full native resolution, then split into 8
+horizontal strips (PANEL_COUNT = 8) before any processing begins.
+
+  Why pre-slice?
+    The source image can be very large (several megapixels).  If every worker
+    process decoded the full image independently, memory usage and I/O would
+    dominate.  Instead, each strip is pre-saved as an uncompressed BMP into a
+    temporary directory — BMP loads nearly instantly because it requires no
+    decompression.
+
+  Single-Thread mode  → 8 panels processed sequentially, top panel first.
+  Multi-Core  mode    → 8 panels dispatched to a Pool, all running at the same
+                        time; results yielded via pool.imap_unordered() as
+                        each panel finishes (may arrive out of order).
+
+  Work per panel:
+    Each worker process (_panel_worker) opens the pre-sliced BMP, then applies
+    a 4-pass filter pipeline using Pillow:
+        Pass 1–4 of each: Blur → Sharpen → Contrast → Sepia → Edge-Detect
+
+  The generator process_image_panels() yields two message types back to the
+  GUI:
+    ("init", ...)   — signals that the image was opened, canvas goes black.
+    ("panel", ...)  — one completed strip, triggers a canvas band-draw.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.  GUI CONCURRENCY  (benchmark_gui.py)
+────────────────────────────────────────────────────────────────────────────────
+
+tkinter is single-threaded; its mainloop() must never be blocked.  The GUI
+solves this with a two-layer concurrency design:
+
+  Layer 1 — Background Worker Thread (threading.Thread)
+    One daemon thread per benchmark run.  It drives whichever benchmark module
+    was selected and puts message tuples into a thread-safe queue.Queue().
+    This thread also owns the multiprocessing.Pool lifecycle.
+
+  Layer 2 — GUI Poll Loop (self.after(40, ...))
+    The tkinter main thread calls _poll_queue() every 40 ms.  It drains the
+    queue and dispatches each message to the appropriate UI update method
+    (update score label, paint a canvas band, update the live timer, etc.).
+    Because all tkinter widget updates happen here — on the main thread — there
+    are no thread-safety issues with the GUI.
+
+  stdout capture:
+    A _StdoutProxy is installed at startup.  When the benchmark thread calls
+    print(), the proxy checks a thread-local variable; if a _QueueWriter is
+    installed for that thread, the text is routed into the queue and appears
+    in the Output Log panel instead of the terminal.
+
+  Live timer:
+    A separate after()-loop (_tick_timer) fires every 100 ms and updates the
+    elapsed-time label while a benchmark is running.
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.  SEQUENTIAL vs. PARALLEL BREAKDOWN
+────────────────────────────────────────────────────────────────────────────────
+
+Below is an estimate of which code paths are sequential (one thread/process)
+and which are parallel (multiple processes or threads at the same time).
+
+┌─────────────────────────────────────────────────────┬────────────┬──────────┐
+│  Code Section                                       │ Sequential │ Parallel │
+├─────────────────────────────────────────────────────┼────────────┼──────────┤
+│  GUI startup, layout, system-info queries           │    100 %   │    0 %   │
+│  Ray Tracer — scene building (build_scene)          │    100 %   │    0 %   │
+│  Ray Tracer — chunk task list construction          │    100 %   │    0 %   │
+│  Ray Tracer — single-core pixel rendering           │    100 %   │    0 %   │
+│  Ray Tracer — multi-core pixel rendering            │      0 %   │  100 %   │
+│  Ray Tracer — result collection + score calc        │    100 %   │    0 %   │
+│  Image Processor — image open + slicing to BMP     │    100 %   │    0 %   │
+│  Image Processor — single-thread panel filtering   │    100 %   │    0 %   │
+│  Image Processor — multi-core panel filtering      │      0 %   │  100 %   │
+│  Image Processor — result aggregation + score      │    100 %   │    0 %   │
+│  GUI queue dispatch + canvas drawing               │    100 %   │    0 %   │
+│  Live timer tick                                    │    100 %   │    0 %   │
+│  Score history read/write (JSON)                    │    100 %   │    0 %   │
+└─────────────────────────────────────────────────────┴────────────┴──────────┘
+
+Overall program execution estimate (Multi-Core mode):
+  ┌────────────────────────────────┬────────┐
+  │  Sequential overhead           │ ~15 %  │
+  │  Parallel compute (pixel/filt) │ ~85 %  │
+  └────────────────────────────────┴────────┘
+
+The 15% sequential overhead includes:
+  - Spawning worker processes (fork/spawn cost on Windows)
+  - Pre-slicing the source image into BMP strips
+  - Serialising task arguments and deserialising results across process boundaries
+  - Collecting and ordering completed chunks
+  - All GUI updates and rendering
+
+Amdahl's Law note:
+  Because 85% of the work is parallel, the theoretical maximum speedup on an
+  N-core machine is:  1 / (0.15 + 0.85/N)
+  On this 16-core machine that is roughly ×5.5 at best.
+  The benchmark reported ×54 scaling for the Ray Tracer because the multi-core
+  score formula also multiplies by cpu_count (matching Cinebench convention),
+  so it measures raw throughput capacity, not wall-clock speedup ratio.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.  DATA FLOW SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+  [Main Process — GUI Thread]
+       │
+       │  spawns
+       ▼
+  [Worker Thread]  ─── drives ──► [multiprocessing.Pool]
+       │                                │  N worker processes
+       │                                │  each computes one chunk/panel
+       │                                ▼
+       │◄──── results via Pool ─── [Worker Processes]
+       │
+       │  puts messages into queue.Queue()
+       ▼
+  [GUI Poll Loop (after 40 ms)]
+       │  dispatches
+       ├──► Update score labels
+       ├──► Paint canvas band (progressive reveal)
+       ├──► Update live timer
+       └──► Refresh history table
+
+
+────────────────────────────────────────────────────────────────────────────────
+6.  TECHNOLOGIES USED
+────────────────────────────────────────────────────────────────────────────────
+
+  multiprocessing.Pool        True process-based parallelism (bypasses GIL)
+  multiprocessing.Pool.imap_unordered()   Streaming results, no wait-for-all
+  threading.Thread            Non-blocking GUI — keeps UI responsive
+  queue.Queue                 Thread-safe message passing (worker → GUI)
+  tkinter + ttk               GUI framework (single-threaded event loop)
+  Pillow (PIL)                Image I/O, filter operations, canvas rendering
+  json                        Persistent score history across sessions
+
+================================================================================
+  END OF ANALYSIS
+================================================================================
