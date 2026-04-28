@@ -30,7 +30,17 @@ import pyrender_benchmark       as _rt   # noqa: E402
 import parallel_image_processor as _ip   # noqa: E402
 
 # ── Single source image used by both benchmarks ───────────────────────────────
-_SOURCE_IMAGE = os.path.join(_HERE, "test_input", "2x-2x-2x-2x-6yefSc.png")
+def _find_source_image():
+    """Return the first image found in test_input/, or None if the folder is empty."""
+    _exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+    folder = os.path.join(_HERE, "test_input")
+    if os.path.isdir(folder):
+        for name in sorted(os.listdir(folder)):
+            if os.path.splitext(name)[1].lower() in _exts:
+                return os.path.join(folder, name)
+    return None
+
+_SOURCE_IMAGE = _find_source_image()
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 _BG    = "#0d0d1a"   # window background
@@ -760,7 +770,12 @@ class App(tk.Tk):
                             _, score, elapsed, workers, _chunks = item
                     q.put(("rt_score", m, score, elapsed, workers))
                 else:
-                    img_path = _SOURCE_IMAGE
+                    img_path = _find_source_image()
+                    if img_path is None:
+                        q.put(("log", "\n[ERROR] No image found in test_input/.\n"
+                                      "        Please add a .jpg or .png file to the test_input folder.\n"))
+                        q.put(("ip_score", m, 0, 0.0, 1, _ip.PANEL_COUNT))
+                        continue
                     panel_count = _ip.PANEL_COUNT
                     t_start = time.perf_counter()
                     for item in _ip.process_image_panels(img_path, m):
@@ -849,8 +864,12 @@ class App(tk.Tk):
                 _PILImg.MAX_IMAGE_PIXELS = None
                 # Load + cache the source image at canvas size once
                 if not getattr(self, "_ip_src_img", None):
-                    src = _PILImg.open(_SOURCE_IMAGE).convert("RGB")
-                    self._ip_src_img = src.resize((cw, ch), _PILImg.LANCZOS)
+                    _src = _find_source_image()
+                    if _src:
+                        src = _PILImg.open(_src).convert("RGB")
+                        self._ip_src_img = src.resize((cw, ch), _PILImg.LANCZOS)
+                    else:
+                        self._ip_src_img = None
                 band = self._ip_src_img.crop((0, display_y, cw, display_y + display_h))
                 photo = ImageTk.PhotoImage(band)
                 self._ip_panel_photos.append(photo)   # prevent GC
