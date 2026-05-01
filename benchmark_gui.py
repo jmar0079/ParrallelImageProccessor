@@ -111,61 +111,72 @@ sys.stdout = _StdoutProxy()
 # ─────────────────────────────────────────────────────────────────────────────
 # System information
 # ─────────────────────────────────────────────────────────────────────────────
-import subprocess as _sp
-
-
-def _wmic(args: list[str]) -> list[str]:
-    """Run a wmic query and return non-header, non-empty lines."""
+def _detect_gpus() -> list[str]:
+    """Return a list of GPU name strings using the best available method."""
+    # 1. Try GPUtil (pip install gputil)
     try:
-        out = _sp.check_output(
-            ["wmic"] + args, text=True,
-            stderr=_sp.DEVNULL, timeout=6,
-        )
-        return [l.strip() for l in out.splitlines()
-                if l.strip() and l.strip().lower() not in ("name", "caption",
-                "totalphysicalmemory", "numberoflogicalprocessors")]
+        import GPUtil
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            return [g.name for g in gpus]
     except Exception:
-        return []
+        pass
+
+    # 2. Try pynvml / nvidia-ml-py (NVIDIA only)
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        names = [
+            pynvml.nvmlDeviceGetName(pynvml.nvmlDeviceGetHandleByIndex(i))
+            for i in range(pynvml.nvmlDeviceGetCount())
+        ]
+        if names:
+            return names
+    except Exception:
+        pass
+
+    # 3. wmi (Windows only, no extra install needed usually)
+    try:
+        import wmi
+        c = wmi.WMI()
+        names = [v.Name for v in c.Win32_VideoController() if v.Name]
+        if names:
+            return names
+    except Exception:
+        pass
+
+    # 4. Fallback: wmic subprocess (Windows; no third-party deps)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["wmic", "path", "win32_VideoController", "get", "name"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        names = [l.strip() for l in out.splitlines()
+                 if l.strip() and l.strip().lower() != "name"]
+        if names:
+            return names
+    except Exception:
+        pass
+
+    return ["N/A"]
 
 
 def _sys_info() -> dict:
-    # CPU name
-    cpu_lines = _wmic(["cpu", "get", "name"])
-    cpu = cpu_lines[0] if cpu_lines else "Unknown"
-
-    # Logical core count
-    core_lines = _wmic(["cpu", "get", "NumberOfLogicalProcessors"])
-    try:
-        cores = int(core_lines[0])
-    except (IndexError, ValueError):
-        cores = multiprocessing.cpu_count()
-
-    # RAM  (TotalPhysicalMemory is in bytes)
-    ram_lines = _wmic(["computersystem", "get", "TotalPhysicalMemory"])
-    try:
-        ram = f"{int(ram_lines[0]) / 1_073_741_824:.1f} GB"
-    except (IndexError, ValueError):
-        ram = "N/A"
-
-    # OS caption
-    os_lines = _wmic(["os", "get", "caption"])
-    os_str = os_lines[0] if os_lines else f"{platform.system()} {platform.release()}"
-
-    # Python version
-    py_ver = platform.python_version()
-
-    # GPUs
-    gpu_lines = _wmic(["path", "win32_VideoController", "get", "name"])
-    gpus = gpu_lines if gpu_lines else ["N/A"]
-
-    return {
-        "cpu":   cpu,
-        "cores": cores,
-        "ram":   ram,
-        "os":    os_str,
-        "python": py_ver,
-        "gpus":  gpus,
+    info = {
+        "cpu":    platform.processor() or platform.machine() or "Unknown",
+        "cores":  multiprocessing.cpu_count(),
+        "os":     f"{platform.system()} {platform.release()}",
+        "python": platform.python_version(),
+        "ram":    "N/A",
+        "gpus":   _detect_gpus(),
     }
+    try:
+        import psutil  # optional
+        info["ram"] = f"{psutil.virtual_memory().total / 1_073_741_824:.1f} GB"
+    except ImportError:
+        pass
+    return info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
